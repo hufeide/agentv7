@@ -1,0 +1,45 @@
+# 配置文件 - skills 配置
+
+# 支持的 Skills 列表
+available_skills:
+  - name: code_writer
+    description: "根据需求编写代码"
+    enabled: true
+
+  - name: code_debugger
+    description: "分析和修复代码错误"
+    enabled: true
+
+  - name: code_updater
+    description: "补充和更新代码功能"
+    enabled: true
+
+  - name: code_refactor
+    description: "重构代码以提高可读性和性能"
+    enabled: true
+
+  - name: code_review
+    description: "审查代码质量和风格"
+    enabled: true
+
+# 默认配置
+default_config:
+  # 代码语言支持
+  supported_languages:
+    - python
+    - javascript
+    - typescript
+    - java
+    - go
+    - rust
+
+  # 文件路径配置
+  file_paths:
+    base_dir: "."
+    temp_dir: "/tmp/skills"
+    backup: true
+
+  # 调试配置
+  debug:
+    verbose: false
+    log_changes: true

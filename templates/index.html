@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Web Interface</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Agent Web Interface</h1>
+            <p class="subtitle">Execute tasks and view real-time logs</p>
+        </header>
+
+        <main class="main-layout">
+            <!-- 左侧：任务输入和结果 -->
+            <div class="left-panel">
+                <section class="task-input-section">
+                    <h2>Task Input</h2>
+                    <textarea id="taskInput" placeholder="Enter your task description here..." rows="4"></textarea>
+                    <div class="button-group">
+                        <button id="executeBtn" class="btn btn-primary">Execute</button>
+                        <button id="clearBtn" class="btn btn-secondary">Clear</button>
+                    </div>
+                </section>
+
+                <section class="status-section">
+                    <h2>Status</h2>
+                    <div class="status-display">
+                        <div class="status-indicator">
+                            <span id="statusIcon" class="status-icon status-idle"></span>
+                            <span id="statusText">Idle</span>
+                        </div>
+                        <div class="progress-bar-container">
+                            <div id="progressBar" class="progress-bar"></div>
+                        </div>
+                        <div class="task-info">
+                            <span id="taskId">Task ID: -</span>
+                            <span id="taskTime">Time: -</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="result-section">
+                    <h2>Result</h2>
+                    <div id="resultContainer" class="result-container">
+                        <pre id="resultContent" class="result-content">No result yet</pre>
+                    </div>
+                </section>
+            </div>
+
+            <!-- 右侧：日志记录 -->
+            <div class="right-panel">
+                <section class="logs-section">
+                    <div class="logs-header">
+                        <h2>Execution Logs</h2>
+                        <div class="logs-controls">
+                            <button id="collapseAllBtn" class="btn btn-small">Collapse All</button>
+                            <button id="expandAllBtn" class="btn btn-small">Expand All</button>
+                            <button id="clearLogsBtn" class="btn btn-small">Clear Logs</button>
+                        </div>
+                    </div>
+                    <div id="logsContainer" class="logs-container">
+                        <div class="session-group" data-session-id="initial">
+                            <div class="session-header">
+                                <span class="session-title">Initial Session</span>
+                                <span class="session-toggle">▼</span>
+                            </div>
+                            <div class="session-logs">
+                                <div class="log-entry log-info">
+                                    <span class="log-time">--:--:--</span>
+                                    <span class="log-level">INFO</span>
+                                    <span class="log-message">Ready to execute tasks</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <footer>
+            <p>Powered by AgentOS v6 | Flask + SSE</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

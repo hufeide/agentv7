@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSE Connection Diagnostics</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #4ec9b0;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .success {
+            background: #2d5a2d;
+            border: 1px solid #4caf50;
+        }
+        .error {
+            background: #5a2d2d;
+            border: 1px solid #f44336;
+        }
+        .info {
+            background: #2d3a5a;
+            border: 1px solid #2196f3;
+        }
+        .log-entry {
+            padding: 5px 0;
+            border-bottom: 1px solid #333;
+        }
+        .timestamp {
+            color: #569cd6;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #764ba2;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        #logs {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #252526;
+            padding: 10px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SSE Connection Diagnostics</h1>
+        
+        <div id="connectionStatus" class="status info">
+            Status: Ready
+        </div>
+        
+        <div>
+            <button id="testConnection">Test Connection</button>
+            <button id="testSSE">Test SSE Stream</button>
+            <button id="clearLogs">Clear Logs</button>
+        </div>
+        
+        <h2>Logs</h2>
+        <div id="logs"></div>
+    </div>
+
+    <script>
+        const logs = document.getElementById('logs');
+        const statusDiv = document.getElementById('connectionStatus');
+        let eventSource = null;
+
+        function addLog(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            const timestamp = new Date().toLocaleTimeString();
+            entry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${message}`;
+            logs.appendChild(entry);
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        function updateStatus(message, type) {
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${type}`;
+        }
+
+        document.getElementById('testConnection').addEventListener('click', async () => {
+            addLog('Testing basic HTTP connection...');
+            try {
+                const response = await fetch('http://localhost:5000/');
+                if (response.ok) {
+                    addLog('✓ HTTP connection successful', 'success');
+                    updateStatus('HTTP: Connected', 'success');
+                } else {
+                    addLog(`✗ HTTP connection failed: ${response.status}`, 'error');
+                    updateStatus('HTTP: Failed', 'error');
+                }
+            } catch (error) {
+                addLog(`✗ HTTP connection error: ${error.message}`, 'error');
+                updateStatus('HTTP: Error', 'error');
+            }
+        });
+
+        document.getElementById('testSSE').addEventListener('click', () => {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+                addLog('Closed existing SSE connection');
+            }
+
+            addLog('Creating SSE connection...');
+            updateStatus('SSE: Connecting...', 'info');
+
+            eventSource = new EventSource('http://localhost:5000/api/logs/test-task-id');
+
+            eventSource.onopen = () => {
+                addLog('✓ SSE connection opened', 'success');
+                updateStatus('SSE: Connected', 'success');
+            };
+
+            eventSource.onmessage = (event) => {
+                addLog(`SSE message: ${event.data.substring(0, 100)}...`);
+            };
+
+            eventSource.onerror = (error) => {
+                const state = eventSource.readyState;
+                const stateNames = {
+                    0: 'CONNECTING',
+                    1: 'OPEN',
+                    2: 'CLOSED'
+                };
+                addLog(`✗ SSE error - State: ${stateNames[state]} (${state})`, 'error');
+                updateStatus(`SSE: Error (${stateNames[state]})`, 'error');
+                
+                if (state === EventSource.CLOSED) {
+                    addLog('SSE connection closed', 'error');
+                }
+            };
+        });
+
+        document.getElementById('clearLogs').addEventListener('click', () => {
+            logs.innerHTML = '';
+            addLog('Logs cleared');
+        });
+
+        // Auto-test on load
+        addLog('Diagnostics loaded. Click buttons to test connections.');
+    </script>
+</body>
+</html>
