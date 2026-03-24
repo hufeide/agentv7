@@ -2118,8 +2118,11 @@ class ExecutionEngine:
             else:
                 self._completed_steps.add(event.step_id)
 
-        # 【修复】即使重复，也要检查任务是否完成（在锁外调用）
+        # 【修复】即使重复，也要检查任务是否完成并发布下游步骤（在锁外调用）
         if is_duplicate:
+            # 即使是重复事件，也要尝试发布下游步骤
+            # 这是因为可能之前的发布失败了
+            asyncio.create_task(self._delayed_publish_ready_steps())
             await self._check_and_publish_completion()
             return
 
@@ -3271,7 +3274,7 @@ class ProductionAgentOS:
 async def main():
     import traceback
     agent = ProductionAgentOS(worker_count=2, skills_dir="skills", tools_dir="tools")
-    task = "/home/aixz/data/hxf/bigmodel/ai_code/testp/agentv7/sum_calculator.py读取这个文件，然后总结其中函数的功能"
+    task = "code今天的日子，然后搜索今天新闻"
     try:
         result = await agent.run(task, timeout=300)
         
