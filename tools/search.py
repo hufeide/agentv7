@@ -80,6 +80,10 @@ class TavilySearchTool:
             logger.error(f"[Tavily] Search failed: {e}")
             return self._mock_search(query, max_results)
 
+    async def execute(self, query: str, max_results: int = 5, **kwargs) -> Dict[str, Any]:
+        """执行搜索（符合工具接口）"""
+        return await self.search(query, max_results=max_results, **kwargs)
+
     async def search_finance(self, query: str, max_results: int = 5) -> Dict[str, Any]:
         """金融相关搜索"""
         finance_domains = [

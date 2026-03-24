@@ -12,7 +12,11 @@ class FileReadTool:
     def __init__(self, base_dir: str = "."):
         self.base_dir = base_dir
 
-    async def read_file(self, filepath: str) -> Dict[str, Any]:
+    async async def execute(self, filepath: str) -> Dict[str, Any]:
+        """执行文件读取（符合工具接口）"""
+        return await self.read_file(filepath)
+
+    def read_file_sync(self, filepath: str) -> Dict[str, Any]:
         """
         读取文件内容
 
