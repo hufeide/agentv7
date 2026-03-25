@@ -76,6 +76,19 @@ class TavilySearchTool:
         except httpx.TimeoutException:
             logger.error("[Tavily] Search timeout")
             return self._mock_search(query, max_results)
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[Tavily] Search HTTP error {e.response.status_code}: {e.response.text}")
+            # 对于 432 错误（配额超限），返回特殊标记的降级结果
+            if e.response.status_code == 432:
+                logger.warning("[Tavily] API quota exceeded, using degraded results")
+                return {
+                    "query": query,
+                    "results": [],
+                    "answer": None,
+                    "images": [],
+                    "detail": "API quota exceeded - using empty results"
+                }
+            return self._mock_search(query, max_results)
         except Exception as e:
             logger.error(f"[Tavily] Search failed: {e}")
             return self._mock_search(query, max_results)

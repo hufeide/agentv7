@@ -29,6 +29,31 @@ Use this skill when you need to:
 | `refactor` | code, refactoring_type | Improve code structure |
 | `review` | code, style_guide | Check code quality |
 
+## IMPORTANT: Tool Usage Rules
+
+**DO NOT call `write` as a tool!**
+
+The `write` action is an INTERNAL skill logic, not a tool call. You should:
+1. Directly write the code in your response
+2. Use the available tools (bash_execute, file_write, file_read) for file operations
+
+Available tools for file operations:
+- `bash_execute(command)` - Execute shell commands
+- `file_write(filepath, content)` - Write file content (PARAMETER MUST BE `filepath`, NOT `file_name`)
+- `file_read(filepath)` - Read file content (PARAMETER MUST BE `filepath`, NOT `file_name`)
+
+## When to Use File Tools
+
+When the task asks you to "save", "store", "write to file", or "create a file":
+1. First use the `write` action internally to generate the code
+2. Then call `file_write(filepath, content)` to save the code to a file
+3. Verify by calling `file_read(filepath)` or `bash_execute(cat filepath)` if needed
+
+Example workflow for "write an add function and save to /tmp/add.py":
+1. Generate code using write action (internal)
+2. Call file_write with filepath="/tmp/add.py" and content="def add(a, b): return a + b"
+3. Optionally verify with bash_execute("cat /tmp/add.py")
+
 ## Supported Languages
 
 | Language | Extension | Characteristics |

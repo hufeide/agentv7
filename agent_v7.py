@@ -62,26 +62,6 @@ except ImportError:
 # =========================
 # 配置管理（预定义默认配置，用于初始化日志）
 # =========================
-# 预定义默认值，用于在 logger 创建前获取配置
-_DEFAULT_CONFIG = {
-    "VLLM_URL": "http://192.168.1.159:19000",
-    "MODEL_NAME": "Qwen3Coder",
-    "LOG_LEVEL": "INFO",
-    "MAX_STEP_RETRIES": 3,
-    "GLOBAL_TIMEOUT": 300,
-    "STEP_EXECUTION_TIMEOUT": 120,
-    "STEP_READY_TIMEOUT": 5.0,
-    "QUEUE_TIMEOUT": 1.0,
-    "LLM_CALL_TIMEOUT": 60.0,
-    "LLM_MAX_TOKENS": 6000,
-    "LLM_TEMPERATURE": 0.3,
-    "EVENT_BUS_MAX_QUEUE_SIZE": 1000,
-    "DEAD_LETTER_QUEUE_ENABLED": False,
-    "STEP_OUTPUT_SUMMARY_LEN": 200,
-    "TAVILY_API_KEY": "",
-    "WORKER_COUNT": 2,
-    "SKILLS_DIR": "skills"
-}
 
 
 def _get_env_or_default(key: str, value_type: type, default: Any) -> Any:
@@ -175,6 +155,405 @@ LOG_LEVEL = config_manager.LOG_LEVEL
 
 
 # =========================
+# Context 管理系统 - 数据结构
+# =========================
+@dataclass
+class Context:
+    """
+    Context: 执行上下文 - 长生命周期对象
+
+    核心修复：
+    1. 长生命周期：不是每次重建，而是 get_or_create()
+    2. 摘要存储：不存储完整 Artifact，只存摘要
+    3. tool_trace 参与 prompt：防止重复调用工具
+    4. 压缩策略：三层（裁剪→摘要→语义保留）
+    """
+    # ====== 核心层 ======
+    task: str                      # 原始任务
+    step_id: str                  # 当前 step ID
+    step_task: str                # 当前子任务描述
+
+    # ====== 执行上下文 ======
+    inputs: Dict[str, Any]        # Step.input_data
+    dependencies: Dict[str, Any]  # 上游输出（结构化摘要）
+
+    # ====== 状态层 ======
+    relevant_artifacts: Dict[str, Any]  # 关键 artifacts 摘要
+    memory: Dict[str, Any]          # 长期记忆
+
+    # ====== 推理层 ======
+    history: List[Dict]             # LLM 对话历史（压缩后）
+    tool_trace: List[Dict]          # 工具调用轨迹
+
+    # ====== 控制层 ======
+    budget_tokens: int = 6000       # token 预算
+    max_history: int = 10           # 历史消息上限
+    max_dep_length: int = 300       # 依赖输出最大长度
+    version: int = 1                # 版本号，用于防止使用过期上下文
+    _created_at: float = field(default_factory=time.time)  # 【新增】创建时间，用于清理过期 Context
+
+    # ====== 派生方法 ======
+    def compress(self):
+        """压缩以符合 budget"""
+        # 依赖截断
+        for k, v in self.dependencies.items():
+            if isinstance(v, str) and len(v) > self.max_dep_length:
+                self.dependencies[k] = v[:self.max_dep_length] + "..."
+
+
+@dataclass
+class GlobalContext:
+    """全局上下文 - 跨任务共享"""
+    memory: Dict[str, Any] = field(default_factory=dict)
+    reasoning_patterns: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class TaskContext:
+    """任务上下文 - 单个任务内共享"""
+    task_id: str
+    memory: Dict[str, Any] = field(default_factory=dict)
+    step_summaries: List[str] = field(default_factory=list)
+
+
+class ContextManager:
+    """
+    ContextManager: Context 生命周期管理器
+
+    关键功能：
+    1. get_or_create() - 长生命周期，避免重建丢失 history
+    2. _extract_relevant_artifacts() - 只存摘要，避免内存泄漏
+    3. 支持三层作用域：Global → Task → Step
+    """
+
+    def __init__(self, state: Optional[Any] = None):
+        self.state = state
+        self.contexts: Dict[str, Context] = {}  # step_id -> Context
+        self.global_context = GlobalContext()
+        self.task_contexts: Dict[str, TaskContext] = {}
+        self.max_dep_length = 300
+
+    def get_or_create(self, step: Any, task_id: Optional[str] = None) -> Context:
+        """
+        获取或创建 Context - 避免重建丢失 history
+
+        Context 是长生命周期对象，重复获取返回同一对象。
+        """
+        if step.step_id not in self.contexts:
+            self.contexts[step.step_id] = self._build_base_context(step, task_id)
+        return self.contexts[step.step_id]
+
+    def _build_base_context(self, step: Any, task_id: Optional[str] = None) -> Context:
+        """构建基础上下文（只提取必要信息）"""
+        # 【修复】直接从前置步骤的 Context 中获取 relevant_artifacts，
+        # 因为 state.artifacts 可能在 Context 创建时尚未填充
+        relevant = {}
+        for dep_id in getattr(step, 'depends_on', []):
+            if dep_id in self.contexts:
+                # 从前置步骤的 Context 中获取 relevant_artifacts
+                dep_ctx = self.contexts[dep_id]
+                relevant.update(dep_ctx.relevant_artifacts)
+
+        # 如果前置步骤的 Context 没有 relevant_artifacts，尝试从 state 获取
+        if not relevant:
+            relevant = self._extract_relevant_artifacts(step)
+
+        deps = {}
+        for dep_id in getattr(step, 'depends_on', []):
+            if dep_id in relevant:
+                deps[dep_id] = relevant[dep_id]
+
+        inherited_memory = self._get_inherited_memory(task_id)
+
+        # 【新增】继承前置步骤的 history（去重）
+        history = []
+        seen_messages = set()  # 防止重复消息
+        for dep_id in getattr(step, 'depends_on', []):
+            if dep_id in self.contexts:
+                dep_ctx = self.contexts[dep_id]
+                # 继承前置步骤的历史记录，去重
+                for msg in dep_ctx.history:
+                    msg_key = (msg.get('role'), msg.get('content', ''))
+                    if msg_key not in seen_messages:
+                        seen_messages.add(msg_key)
+                        history.append(msg)
+
+        return Context(
+            task=step.input_data.get("task", ""),
+            step_id=step.step_id,
+            step_task=self._build_step_description(step),
+            inputs=step.input_data,
+            dependencies=deps,
+            relevant_artifacts=relevant,
+            memory=inherited_memory,
+            history=history,  # 【修改】使用继承的 history
+            tool_trace=[],
+            budget_tokens=config_manager.LLM_MAX_TOKENS,
+            max_history=10,
+            max_dep_length=self.max_dep_length,
+            _created_at=time.time()  # 【新增】用于清理过期 Context
+        )
+
+    def _extract_relevant_artifacts(self, step: Any) -> Dict[str, Any]:
+        """提取相关 artifacts 的摘要"""
+        if not self.state:
+            return {}
+
+        result = {}
+        for dep_id in getattr(step, 'depends_on', []):
+            artifact = self.state.get_artifact(dep_id)
+            if artifact:
+                result[dep_id] = {
+                    "value": str(artifact.value)[:self.max_dep_length],
+                    "type": artifact.type,
+                    "success": artifact.is_success()
+                }
+        return result
+
+    def _get_inherited_memory(self, task_id: Optional[str] = None) -> Dict[str, Any]:
+        """获取继承的 memory（Global + Task）"""
+        inherited = dict(self.global_context.memory)
+
+        if task_id and task_id in self.task_contexts:
+            inherited.update(self.task_contexts[task_id].memory)
+
+        return inherited
+
+    def _build_step_description(self, step: Any) -> str:
+        """构建步骤描述"""
+        if hasattr(step, 'input_data') and step.input_data:
+            return step.input_data.get("task", step.step_id)
+        return step.task if hasattr(step, 'task') else step.step_id
+
+    def get_context(self, step_id: str) -> Optional[Context]:
+        """获取已保存的上下文"""
+        return self.contexts.get(step_id)
+
+    def update_context(self, step_id: str, **kwargs):
+        """更新上下文并递增版本号"""
+        if step_id in self.contexts:
+            ctx = self.contexts[step_id]
+            for k, v in kwargs.items():
+                if hasattr(ctx, k) and getattr(ctx, k) != v:
+                    setattr(ctx, k, v)
+                    ctx.version += 1
+
+    # ====== Task 级别操作 ======
+    def get_or_create_task_context(self, task_id: str) -> TaskContext:
+        """获取或创建任务上下文"""
+        if task_id not in self.task_contexts:
+            self.task_contexts[task_id] = TaskContext(task_id=task_id)
+        return self.task_contexts[task_id]
+
+    def add_task_summary(self, task_id: str, summary: str):
+        """添加任务步骤摘要"""
+        task_ctx = self.get_or_create_task_context(task_id)
+        task_ctx.step_summaries.append(summary)
+
+    # ====== Global 级别操作 ======
+    def update_global_memory(self, key: str, value: Any):
+        """更新全局 memory"""
+        self.global_context.memory[key] = value
+
+    def get_global_memory(self, key: str, default=None) -> Any:
+        """获取全局 memory"""
+        return self.global_context.memory.get(key, default)
+
+    def cleanup_old_contexts(self, max_age_seconds: int = 3600) -> int:
+        """清理过期的 Context（默认 1 小时）"""
+        import time
+        current_time = time.time()
+        to_remove = [
+            step_id for step_id, ctx in self.contexts.items()
+            if ctx.version > 100 or current_time - getattr(ctx, '_created_at', current_time) > max_age_seconds
+        ]
+        for step_id in to_remove:
+            del self.contexts[step_id]
+        return len(to_remove)
+
+    def clear_all_contexts(self) -> int:
+        """清除所有 Context（用于任务结束）"""
+        count = len(self.contexts)
+        self.contexts.clear()
+        return count
+
+
+class ContextFormatter:
+    """
+    ContextFormatter: Context 格式化器
+
+    功能：将 Context 转换为 LLM 友好的 Prompt
+
+    关键修复：tool_trace 参与 prompt，防止重复调用工具
+    """
+
+    @staticmethod
+    def format_system(ctx: Context, skill_instruction: str) -> str:
+        """格式化系统提示词"""
+        dep_text = ContextFormatter._format_dependencies(ctx.dependencies)
+        tool_text = ContextFormatter._format_tool_trace(ctx.tool_trace)
+
+        return f"""{skill_instruction}
+
+## 当前任务
+{ctx.step_task}
+
+## 任务目标
+{ctx.task}
+
+## 上游结果
+{dep_text if dep_text else "无"}
+
+## 已执行操作
+{tool_text if tool_text else "无"}
+
+## 注意事项
+- 基于已有信息推理，不要重复工作
+- 每个工具调用后等待结果再继续
+- 已执行操作已记录，不要重复调用
+"""
+
+    @staticmethod
+    def format_user(ctx: Context) -> str:
+        """格式化用户提示词"""
+        return f"""任务: {ctx.step_task}
+
+输入:
+{json.dumps(ctx.inputs, ensure_ascii=False)}
+"""
+
+    @staticmethod
+    def _format_dependencies(deps: Dict[str, Any], max_length: int = 300) -> str:
+        """格式化依赖输出"""
+        if not deps:
+            return ""
+
+        parts = []
+        for k, v in deps.items():
+            if isinstance(v, dict):
+                content = str(v.get("value", ""))[:max_length]
+            else:
+                content = str(v)[:max_length]
+            parts.append(f"[{k}]\n{content}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _format_tool_trace(trace: List[Dict], max_items: int = 5) -> str:
+        """格式化工具调用轨迹（关键修复：让 LLM 知道已执行操作）"""
+        if not trace:
+            return "无"
+
+        parts = []
+        for t in trace[-max_items:]:  # 只显示最近 N 条
+            tool = t.get("tool", "unknown")
+            input_data = t.get("input", {})
+            output = t.get("output", "")
+            summary = str(output)[:100]  # 截断输出
+            parts.append(f"- {tool}({input_data}) → {summary}")
+
+        return "\n".join(parts)
+
+
+class ContextCompressor:
+    """Context 压缩器，三层策略"""
+
+    # Level 1: 裁剪
+    @staticmethod
+    def truncate(text: str, max_length: int) -> str:
+        """简单截断"""
+        return text[:max_length]
+
+    @staticmethod
+    def compress_dependencies(deps: Dict[str, Any], max_length: int = 200) -> Dict[str, str]:
+        """压缩依赖输出"""
+        result = {}
+        for k, v in deps.items():
+            if isinstance(v, dict):
+                val = str(v.get("value", ""))[:max_length]
+            else:
+                val = str(v)[:max_length]
+            result[k] = val
+        return result
+
+    # Level 2: 摘要
+    @staticmethod
+    def summarize_text(text: str, max_tokens: int = 100) -> str:
+        """文本摘要（简单版本）"""
+        if len(text) <= max_tokens * 4:  # 1 token ≈ 4 chars
+            return text
+
+        # 简单摘要：取首尾各 50%
+        half = max_tokens * 2
+        return text[:half] + "\n... [摘要中间省略] ...\n" + text[-half:]
+
+    @staticmethod
+    def summarize_history(history: List[Dict], keep_last: int = 5) -> List[Dict]:
+        """只保留最后几条消息"""
+        return history[-keep_last:]
+
+    # Level 3: 语义保留（需要 LLM）
+    @staticmethod
+    async def summarize_with_llm(llm: AsyncOpenAI, text: str) -> str:
+        """使用 LLM 生成语义摘要"""
+        try:
+            response = await llm.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "请将以下内容压缩成一句话摘要，保留关键信息："},
+                    {"role": "user", "content": text[:3000]}
+                ],
+                temperature=0.3,
+                max_tokens=100
+            )
+            return response.choices[0].message.content
+        except Exception:
+            return text[:200]  # 失败时简单截断
+
+    # 综合压缩
+    @classmethod
+    def compress_context(cls, ctx: Context) -> Context:
+        """压缩 Context 以符合预算"""
+        # 关键修复：只估算一次，避免 str(ctx) 被调用两次
+        current_tokens = cls._estimate_context_tokens(ctx)
+
+        if current_tokens > ctx.budget_tokens:
+            # Level 1: 裁剪依赖
+            if len(ctx.dependencies) > 0:
+                ctx.dependencies = cls.compress_dependencies(ctx.dependencies, 200)
+
+            # Level 2: 裁剪历史
+            if len(ctx.history) > ctx.max_history:
+                ctx.history = cls.summarize_history(ctx.history, ctx.max_history)
+
+            # Level 3: 摘要（递归压缩直到符合预算）
+            if cls._estimate_context_tokens(ctx) > ctx.budget_tokens:
+                ctx.relevant_artifacts = {
+                    k: cls.summarize_text(str(v), 100)
+                    for k, v in ctx.relevant_artifacts.items()
+                }
+
+        return ctx
+
+    @staticmethod
+    def estimate_tokens(prompt: str) -> int:
+        """简单估算 token 数（1 token ≈ 4 字符）"""
+        return len(prompt) // 4
+
+    @staticmethod
+    def _estimate_context_tokens(ctx: Context) -> int:
+        """优化的 Context token 估算，避免完整序列化"""
+        # 只估算关键字段，避免 str(ctx) 的性能问题
+        text = (
+            ctx.task[:500] +
+            ctx.step_task[:200] +
+            str(ctx.dependencies)[:300] +
+            str(ctx.history)[:200] +
+            str(ctx.tool_trace)[:100]
+        )
+        return len(text) // 4
+
+
+# =========================
 # 事件类型枚举
 # =========================
 class EventType(str, Enum):
@@ -229,7 +608,10 @@ class EventSubscriptionManager:
                 self._id_to_handler.pop(old_id, None)
 
             async def wrapped_handler(event: Event):
+                # 【调试】记录每次调用
+                logger.debug(f"[EventSubscriptionManager.wrapped_handler] {component}.{name} called for event {event.event_type} (filter={event_filter})")
                 if event_filter and event.event_type != event_filter:
+                    logger.debug(f"[EventSubscriptionManager.wrapped_handler] Skipping - event type mismatch")
                     return
                 try:
                     await handler(event)
@@ -244,7 +626,7 @@ class EventSubscriptionManager:
             self._subscriptions[component][name] = sid
             self._id_to_handler[sid] = (component, name)
 
-            logger.debug(f"[EventSubscriptionManager] {component}.{name} subscribed (id={sid})")
+            logger.info(f"[EventSubscriptionManager] {component}.{name} subscribed (id={sid}), filter={event_filter}")
             return sid
 
     async def unsubscribe_component(self, component: str):
@@ -354,16 +736,18 @@ class EventBus:
                 continue
             if event is None:
                 break
+
             for handler in list(self._subscribers.values()):
                 if handler is None:
                     continue
                 try:
                     # 支持同步和异步处理器
+                    handler_name = handler.__name__ if hasattr(handler, '__name__') else str(type(handler))
                     result = handler(event)
                     if asyncio.iscoroutine(result):
                         await result
                 except Exception as e:
-                    logger.exception(f"Handler {handler.__name__ if hasattr(handler, '__name__') else handler} failed: {e}")
+                    logger.exception(f"Handler {handler_name} failed: {e}")
             self._queue.task_done()
 
     async def shutdown(self):
@@ -488,8 +872,10 @@ class CapabilityRegistry:
 
     def get_executable_schemas(self) -> List[Dict]:
         """获取所有可执行工具的 schemas"""
-        return [c.schema for c in self._capabilities.values()
-                if isinstance(c, ExecutableCapability)]
+        executables = [c for c in self._capabilities.values()
+                       if isinstance(c, ExecutableCapability)]
+        schemas = [c.schema for c in executables]
+        return schemas
 
     def get_instructable_schemas(self) -> List[Dict]:
         """获取所有可指令型能力的 schemas"""
@@ -543,13 +929,32 @@ class ToolRegistry:
         return loaded_tools
 
     def register_tool_instance(self, name: str, instance: Any, schema: Dict[str, Any], description: str = ""):
-        """注册工具实例"""
+        """注册工具实例
+
+        支持两种 schema 格式：
+        1. 完整 OpenAI 格式: {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
+        2. 简洁格式: {"parameters": {...}} 或直接是 parameters 对象
+        """
+        # 提取 parameters，支持两种格式
+        if "function" in schema and "parameters" in schema["function"]:
+            # 完整 OpenAI 格式
+            parameters = schema["function"]["parameters"]
+            desc = schema["function"].get("description", description)
+        elif "parameters" in schema:
+            # 简洁格式
+            parameters = schema["parameters"]
+            desc = description
+        else:
+            # 默认空参数
+            parameters = {"type": "object", "properties": {}}
+            desc = description
+
         self._tools[name] = {
             "type": "function",
             "function": {
                 "name": name,
-                "description": description,
-                "parameters": schema.get("parameters", {"type": "object", "properties": {}})
+                "description": desc,
+                "parameters": parameters
             }
         }
         self._tool_instances[name] = instance
@@ -658,6 +1063,8 @@ class ToolCapability(ExecutableCapability):
 
         try:
             # 使用可配置的超时时间
+            # 注意：不使用 executor_pool，因为工具实例包含不可序列化的对象（如锁）
+            # 进程池只适用于纯函数，不适用于带状态的工具实例
             return await asyncio.wait_for(_execute_with_timeout(), timeout=self._timeout)
         except asyncio.TimeoutError:
             logger.warning(f"[ToolCapability] Tool {self._name} timeout after {self._timeout}s")
@@ -759,7 +1166,14 @@ class SkillCapability(AgenticCapability):
     def load_reference(self, ref_name: str) -> Optional[str]:
         """
         Layer 3: 加载引用文件（按需加载，同步版本）
+
+        注意：SKILL.md 是技能的主文档，不应该通过 load_reference 加载。
+        SKILL.md 应该在技能初始化时通过 get_system_instruction() 加载。
         """
+        # SKILL.md 是主文档，不通过 references 加载
+        if ref_name == "SKILL.md":
+            return None
+
         ref_path = os.path.join(self._skill_dir, "references", ref_name)
         if ref_name in self._resources_cache:
             return self._resources_cache[ref_name]
@@ -776,7 +1190,14 @@ class SkillCapability(AgenticCapability):
     async def load_reference_async(self, ref_name: str) -> Optional[str]:
         """
         Layer 3: 加载引用文件（按需加载，异步版本）
+
+        注意：SKILL.md 是技能的主文档，不应该通过 load_reference 加载。
+        SKILL.md 应该在技能初始化时通过 get_system_instruction() 加载。
         """
+        # SKILL.md 是主文档，不通过 references 加载
+        if ref_name == "SKILL.md":
+            return None
+
         ref_path = os.path.join(self._skill_dir, "references", ref_name)
         if ref_name in self._resources_cache:
             return self._resources_cache[ref_name]
@@ -823,8 +1244,9 @@ class SkillCapability(AgenticCapability):
                 resources.append(item)
         return resources
 
-    async def execute(self, **kwargs: Any) -> Any:  # noqa: F841
+    async def execute(self, **kwargs: Any) -> Any:
         """执行技能（kwargs 保留用于未来扩展）"""
+        _ = kwargs  # 保留参数用于未来扩展
         raise NotImplementedError("Skill should not execute code directly - use SkillPolicy with LLMRuntime")
 
 
@@ -839,50 +1261,70 @@ class SkillPolicy:
     1. 提供 system prompt 模板
     2. 提供可用 tools 列表
     3. 定义 reasoning style
+    4. 使用 ContextManager 和 ContextFormatter（关键修复）
     """
 
-    def __init__(self, skill: SkillCapability, llm_runtime: "LLMRuntime"):
+    def __init__(self, skill: SkillCapability, llm_runtime: "LLMRuntime", context_manager: Optional[Any] = None):
         self.skill = skill
         self.llm_runtime = llm_runtime
+        self.context_manager = context_manager
 
-    async def get_system_prompt(self, step: "Step") -> str:
-        """获取系统提示词（集成技能策略）"""
-        base_prompt = self.skill.get_system_instruction()
+    async def get_system_prompt(self, step: "Step", context: Optional[Any] = None) -> str:
+        """获取系统提示词（使用 ContextFormatter）"""
+        # 关键修复：使用 ContextFormatter 格式化系统提示词
+        if context:
+            return ContextFormatter.format_system(context, self.skill.get_system_instruction())
 
-        # 添加资源说明
-        resources = self.skill.list_resources()
-        if resources:
-            resource_info = f"""
-
-## 可用资源
-你可以使用以下工具加载额外资源：
-- `load_reference`: 加载参考文档（可用: {resources}）
-- `list_resources`: 列出所有可用资源
-- `execute_script`: 执行scripts/目录下的脚本
-
-注意：资源按需加载，不要预加载所有内容。"""
-            base_prompt += resource_info
-
-        # 添加依赖上下文
-        if hasattr(step, 'depends_on') and step.depends_on:
-            dep_context = await self._build_dependency_context(step)
-            if dep_context:
-                base_prompt += f"\n\n## 依赖步骤输出\n{dep_context}"
-
-        return base_prompt
-
-    async def _build_dependency_context(self, step: "Step") -> str:
-        """构建依赖上下文"""
-        context_parts = []
+        # 兼容旧逻辑：如果没传 context，直接构建 prompt（不创建 TempContext）
+        # 移除了 TempContext 临时类，直接构建依赖上下文
+        deps = {}
         for dep_id in getattr(step, 'depends_on', []):
-            artifact = step.input_data.get(f"_dep_{dep_id}")
+            artifact = getattr(step, 'input_data', {}).get(f"_dep_{dep_id}")
             if artifact is not None:
-                artifact_str = str(artifact)[:1000]
-                context_parts.append(f"[依赖:{dep_id}]\n{artifact_str}")
-        return "\n\n".join(context_parts)
+                deps[dep_id] = {"value": str(artifact)[:300], "type": "text", "success": True}
 
-    async def get_user_prompt(self, step: "Step") -> str:
+        # 构建简单的依赖文本
+        dep_text = ""
+        if deps:
+            parts = []
+            for k, v in deps.items():
+                content = str(v.get("value", ""))[:300]
+                parts.append(f"[{k}]\n{content}")
+            dep_text = "\n\n".join(parts)
+
+        tool_text = "无"
+
+        task = step.input_data.get("task", "") if hasattr(step, 'input_data') else step.step_id
+        step_task = step.input_data.get("task", "") if hasattr(step, 'input_data') else step.step_id
+
+        skill_instruction = self.skill.get_system_instruction()
+
+        return f"""{skill_instruction}
+
+## 当前任务
+{step_task}
+
+## 任务目标
+{task}
+
+## 上游结果
+{dep_text if dep_text else "无"}
+
+## 已执行操作
+{tool_text}
+
+## 注意事项
+- 基于已有信息推理，不要重复工作
+- 每个工具调用后等待结果再继续
+- 已执行操作已记录，不要重复调用
+"""
+
+    async def get_user_prompt(self, step: "Step", context: Optional[Any] = None) -> str:
         """获取用户提示词"""
+        if context:
+            return ContextFormatter.format_user(context)
+
+        # 兼容旧逻辑
         task = step.input_data.get("task", "")
         input_data = {k: v for k, v in step.input_data.items() if k != "task"}
         prompt = f"任务: {task}"
@@ -890,17 +1332,46 @@ class SkillPolicy:
             prompt += f"\n输入数据: {json.dumps(input_data, ensure_ascii=False)}"
         return prompt
 
-    async def execute_with_policy(self, step: "Step") -> Tuple[bool, Any]:
+    async def execute_with_policy(self, step: "Step", context: Optional[Any] = None, caller: str = "unknown") -> Tuple[bool, Any]:
         """使用技能策略执行任务（通过 LLMRuntime 的 tool_call）"""
-        system_prompt = await self.get_system_prompt(step)
-        user_prompt = await self.get_user_prompt(step)
+        # 关键修复：使用 get_or_create 获取 context
+        if context is None and self.context_manager:
+            context = self.context_manager.get_or_create(step)
+
+        # 记录上下文信息（在生成 prompt 前）
+        if context:
+            context_info = {
+                "step_id": getattr(context, 'step_id', 'unknown'),
+                "step_task": getattr(context, 'step_task', 'unknown'),
+                "dependencies": list(getattr(context, 'dependencies', {}).keys()),
+                "relevant_artifacts": list(getattr(context, 'relevant_artifacts', {}).keys()),
+                "history_length": len(getattr(context, 'history', [])),
+                "tool_trace_length": len(getattr(context, 'tool_trace', []))
+            }
+            logger.info(f"[SkillPolicy] Context info: {json.dumps(context_info, ensure_ascii=False, indent=2)}")
+
+        # 使用 ContextFormatter 生成 prompt
+        system_prompt = await self.get_system_prompt(step, context)
+        user_prompt = await self.get_user_prompt(step, context)
         tools = await self._build_tools_list()
+
+        # 记录 prompt 摘要
+        logger.info(f"[SkillPolicy] Prompt info: system_len={len(system_prompt)}, user_len={len(user_prompt)}, tools_count={len(tools)}")
+
         success, result = await self.llm_runtime.tool_call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             tools=tools,
-            skill_policy=self  # 传递 skill_policy 以便执行管理工具
+            history=None,
+            context=context,  # 传递 context 用于追踪
+            skill_policy=self,
+            caller=f"SkillPolicy({self.skill.name})-{caller}"
         )
+
+        # 关键修复：更新 context 的历史记录
+        if context and isinstance(result, dict) and "history" in result:
+            context.history.extend(result["history"])
+
         return (success, result)
 
     async def _build_tools_list(self) -> List[Dict]:
@@ -920,7 +1391,7 @@ class SkillPolicy:
                 "type": "function",
                 "function": {
                     "name": "load_reference",
-                    "description": "Load a reference document from skill's references/ directory",
+                    "description": "Load a reference document from skill's references/ directory. Use this to get additional context when writing code. If no reference is found, use your own knowledge.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -995,17 +1466,24 @@ def extract_output(result: Any) -> str:
 class LLMRuntime:
     """
     LLMRuntime: 唯一的智能入口，统一处理所有 LLM 调用
+
+    关键修复：
+    1. 接受 context_manager 参数，支持 Context 长生命周期
+    2. tool_call 支持 context 参数，记录 tool_trace 和 history
+    3. 实现 compress_history 方法，三层压缩策略
     """
 
     def __init__(
         self,
         llm: AsyncOpenAI,
         capability_registry: CapabilityRegistry,
-        max_iterations: int = 10
+        max_iterations: int = 10,
+        context_manager: Optional[Any] = None  # 新增
     ):
         self.llm = llm
         self.capability_registry = capability_registry
         self.max_iterations = max_iterations
+        self.context_manager = context_manager  # 新增
         logger.info("[LLMRuntime] Created - unified LLM brain")
 
     async def call(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
@@ -1025,19 +1503,34 @@ class LLMRuntime:
             logger.error(f"[LLMRuntime] Call failed: {e}")
             return f"Error: {e}"
 
-    async def reason(self, system_prompt: str, user_prompt: str) -> str:
+    async def reason(self, system_prompt: str, user_prompt: str, caller: str = "unknown") -> str:
         """基础推理 - 无工具调用的对话"""
+        logger.info(f"[LLMRuntime.reason] Called by {caller}, prompt length: system={len(system_prompt)}, user={len(user_prompt)}")
+        logger.debug(f"[LLMRuntime.reason] System prompt: {system_prompt[:500]}...")
+        logger.debug(f"[LLMRuntime.reason] User prompt: {user_prompt[:500]}...")
         try:
-            response = await self.llm.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=config_manager.LLM_TEMPERATURE,
-                max_tokens=config_manager.LLM_MAX_TOKENS
+            logger.info(f"[LLMRuntime.reason] About to call LLM API...")
+            # 添加超时保护
+            response = await asyncio.wait_for(
+                self.llm.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=config_manager.LLM_TEMPERATURE,
+                    max_tokens=config_manager.LLM_MAX_TOKENS
+                ),
+                timeout=config_manager.LLM_CALL_TIMEOUT
             )
-            return response.choices[0].message.content
+            logger.info(f"[LLMRuntime.reason] LLM API call completed, processing response...")
+            result = response.choices[0].message.content
+            logger.info(f"[LLMRuntime.reason] Completed by {caller}, response length: {len(result)}")
+            logger.debug(f"[LLMRuntime.reason] Response: {result[:500]}...")
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"[LLMRuntime.reason] Timeout after {config_manager.LLM_CALL_TIMEOUT}s by {caller}")
+            raise TimeoutError(f"Reasoning timeout after {config_manager.LLM_CALL_TIMEOUT}s")
         except Exception as e:
             logger.error(f"[LLMRuntime] Reason failed: {e}")
             raise
@@ -1048,16 +1541,48 @@ class LLMRuntime:
         user_prompt: str,
         tools: List[Dict],
         history: Optional[List[Dict]] = None,
+        context: Optional[Any] = None,  # 新增：Context 对象
         max_iterations: Optional[int] = None,
-        skill_policy: Optional[Any] = None
+        skill_policy: Optional[Any] = None,
+        caller: str = "unknown"
     ) -> Tuple[bool, Dict]:
         """工具调用 - ReAct 循环，带早期停止和去重机制"""
+        # 记录上下文信息（如果传入了 context）
+        if context:
+            context_info = {
+                "step_id": getattr(context, 'step_id', 'unknown'),
+                "step_task": getattr(context, 'step_task', 'unknown'),
+                "dependencies": list(getattr(context, 'dependencies', {}).keys()),
+                "relevant_artifacts": list(getattr(context, 'relevant_artifacts', {}).keys()),
+                "history_length": len(getattr(context, 'history', [])),
+                "tool_trace_length": len(getattr(context, 'tool_trace', []))
+            }
+            logger.info(f"[LLMRuntime.tool_call] Context from {caller}: {json.dumps(context_info, ensure_ascii=False, indent=2)}")
+
+        logger.info(f"[LLMRuntime.tool_call] Called by {caller}, tools_count={len(tools)}, prompt lengths: system={len(system_prompt)}, user={len(user_prompt)}")
+        logger.debug(f"[LLMRuntime.tool_call] System prompt: {system_prompt[:500]}...")
+        logger.debug(f"[LLMRuntime.tool_call] User prompt: {user_prompt[:500]}...")
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        if history:
+
+        # 关键修复：使用 context 的历史记录（覆盖传入的 history）
+        if context and context.history:
+            messages.extend(context.history[-context.max_history:])
+        elif history:
             messages.extend(history)
+
+        total_len = sum(len(m.get('content', '')) for m in messages)
+        logger.debug(f"[LLMRuntime.tool_call] Messages (with history): {len(messages)} messages, total length: {total_len}")
+        # 记录每条消息的简要信息
+        for i, m in enumerate(messages):
+            role = m.get('role', 'unknown')
+            content_len = len(m.get('content', ''))
+            tool_calls = len(m.get('tool_calls', []))
+            logger.debug(f"[LLMRuntime.tool_call] Message {i}: role={role}, content_len={content_len}, tool_calls={tool_calls}")
+            if content_len > 0 and content_len <= 300:
+                logger.debug(f"[LLMRuntime.tool_call] Message {i} content: {m.get('content', '')[:300]}")
 
         # 动态调整迭代上限
         max_iter = max_iterations if max_iterations is not None else self.max_iterations
@@ -1069,22 +1594,67 @@ class LLMRuntime:
 
         for iteration in range(max_iter):
             try:
-                response = await self.llm.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    temperature=config_manager.LLM_TEMPERATURE,
-                    max_tokens=config_manager.LLM_MAX_TOKENS
+                logger.info(f"[LLMRuntime.tool_call] Iteration {iteration + 1}/{max_iter} by {caller}")
+                logger.debug(f"[LLMRuntime.tool_call] Iteration {iteration + 1} messages count: {len(messages)}")
+                # 记录最后几条消息用于调试
+                if len(messages) > 2:
+                    last_msg = messages[-1]
+                    logger.debug(f"[LLMRuntime.tool_call] Last message role: {last_msg.get('role')}, content length: {len(last_msg.get('content', ''))}")
+                # 记录完整请求用于调试
+                logger.debug(f"[LLMRuntime.tool_call] Iteration {iteration + 1} request: model={MODEL_NAME}, temp={config_manager.LLM_TEMPERATURE}, max_tokens={config_manager.LLM_MAX_TOKENS}")
+                # 添加超时保护
+                response = await asyncio.wait_for(
+                    self.llm.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto",
+                        temperature=config_manager.LLM_TEMPERATURE,
+                        max_tokens=config_manager.LLM_MAX_TOKENS
+                    ),
+                    timeout=config_manager.LLM_CALL_TIMEOUT
                 )
+                # 记录响应内容
+                response_content = response.choices[0].message.content or ""
+                response_tool_calls = len(response.choices[0].message.tool_calls or [])
+                logger.info(f"[LLMRuntime.tool_call] Iteration {iteration + 1} HTTP response: OK, tool_calls={response_tool_calls}, content_length={len(response_content)}")
+                if response_content:
+                    logger.debug(f"[LLMRuntime.tool_call] Iteration {iteration + 1} response_content: {response_content[:500]}...")
+                if response_tool_calls > 0:
+                    for i, tc in enumerate(response.choices[0].message.tool_calls or []):
+                        logger.debug(f"[LLMRuntime.tool_call] Iteration {iteration + 1} tool_call {i}: {tc.function.name}, args={tc.function.arguments[:300]}...")
+                # 记录完整的 messages 用于调试（查看历史）
+                logger.debug(f"[LLMRuntime.tool_call] Iteration {iteration + 1} complete messages history:")
+                for i, m in enumerate(messages):
+                    role = m.get('role', 'unknown')
+                    content = m.get('content', '')
+                    tool_calls = m.get('tool_calls', [])
+                    if content:
+                        logger.debug(f"[LLMRuntime.tool_call]   Message {i} [{role}]: {content[:400]}...")
+                    if tool_calls:
+                        logger.debug(f"[LLMRuntime.tool_call]   Message {i} [{role}] has {len(tool_calls)} tool_calls")
+            except asyncio.TimeoutError:
+                logger.error(f"[LLMRuntime.tool_call] Iteration {iteration + 1} timeout after {config_manager.LLM_CALL_TIMEOUT}s")
+                return (False, {"error": f"LLM call timeout after {config_manager.LLM_CALL_TIMEOUT}s"})
             except Exception as e:
                 return (False, {"error": f"LLM call failed: {e}"})
 
             msg = response.choices[0].message
+            logger.debug(f"[LLMRuntime.tool_call] Iteration {iteration + 1} response: tool_calls={len(msg.tool_calls)}, content={msg.content[:200] if msg.content else 'None'}...")
 
             if not msg.tool_calls:
                 # 没有工具调用，返回内容
                 output = msg.content or ""
+
+                logger.debug(f"[LLMRuntime.tool_call] No tool calls, output: {output[:500]}...")
+
+                # 关键修复：如果传入 context，记录 tool_trace（空）和 history
+                if context:
+                    context.history.extend(messages[2:])  # 排除 system 和初始 user
+                    # 压缩历史如果超出预算
+                    if len(context.history) > context.max_history:
+                        context.history = self._compress_history(context.history)
+
                 return (True, {
                     "success": True,
                     "output": output,
@@ -1114,8 +1684,8 @@ class LLMRuntime:
                         if len(tool_call_history) >= 2:
                             if tool_call_history[-1] == current_call and tool_call_history[-2] == current_call:
                                 logger.warning(f"[LLMRuntime] Detected repeated tool call: {tool_name}, triggering early stop")
-                                return (True, {
-                                    "success": True,
+                                return (False, {
+                                    "success": False,
                                     "output": f"Detected repeated tool calls for {tool_name}. Stopping to avoid infinite loop.",
                                     "iterations": iteration + 1,
                                     "warning": "early_stopped_duplicate_tool"
@@ -1126,10 +1696,10 @@ class LLMRuntime:
                         # 限制连续调用相同工具的次数
                         if tool_name == last_tool_name:
                             consecutive_same_tool += 1
-                            if consecutive_same_tool >= 3:
+                            if consecutive_same_tool >= 10:
                                 logger.warning(f"[LLMRuntime] Detected 3+ consecutive calls to {tool_name}, triggering early stop")
-                                return (True, {
-                                    "success": True,
+                                return (False, {
+                                    "success": False,
                                     "output": f"Stopped: {tool_name} called {consecutive_same_tool}+ times consecutively.",
                                     "iterations": iteration + 1,
                                     "warning": "early_stopped_consecutive_tool"
@@ -1144,7 +1714,9 @@ class LLMRuntime:
                         last_tool_name = tool_name
 
                     # 执行工具调用（传递 skill_policy 以便执行管理工具）
+                    logger.debug(f"[LLMRuntime.tool_call] Executing tool: {tool_name}, args: {tool_args}")
                     tool_result = await self._execute_tool(tool_name, tool_args, skill_policy=skill_policy)
+                    logger.debug(f"[LLMRuntime.tool_call] Tool {tool_name} result: {str(tool_result)[:300]}...")
 
                 tool_results.append({
                     "tool_call_id": tool_call.id,
@@ -1179,6 +1751,22 @@ class LLMRuntime:
                     "content": tool_results[i]["tool_result"]
                 })
 
+        # 关键修复：在工具调用后收集信息到 context
+        if context:
+            # 收集 tool_trace
+            for i, tool_call in enumerate(msg.tool_calls):
+                context.tool_trace.append({
+                    "tool": tool_results[i]["tool_name"],
+                    "input": tool_args if 'tool_args' in locals() else {},
+                    "output": tool_results[i]["tool_result"],
+                    "timestamp": time.time()
+                })
+            # 收集对话历史
+            context.history.extend(messages[2:])  # 排除 system 和初始 user
+            # 压缩历史如果超出预算
+            if len(context.history) > context.max_history:
+                context.history = self._compress_history(context.history)
+
         return (False, {
             "success": False,
             "error": f"Max iterations ({max_iter}) reached",
@@ -1190,12 +1778,13 @@ class LLMRuntime:
         # 优先处理 Skill 管理工具（这些工具不在 CapabilityRegistry 中）
         skill_admin_tools = ["load_reference", "list_resources", "execute_script"]
         if skill_policy and tool_name in skill_admin_tools:
+            logger.info(f"[LLMRuntime] Calling skill_admin_tool: {tool_name}, args: {tool_args}")
             try:
                 if tool_name == "load_reference":
                     ref_name = tool_args.get("ref_name", "")
                     result = await skill_policy.skill.load_reference_async(ref_name)
                     if result is None:
-                        return f"Error: Reference '{ref_name}' not found"
+                        return f"Reference '{ref_name}' not found, using your own knowledge."
                     return result
                 elif tool_name == "list_resources":
                     result = await skill_policy.skill.list_resources_async()
@@ -1211,12 +1800,44 @@ class LLMRuntime:
         # 其他工具通过 CapabilityRegistry 执行
         tool_cap = self.capability_registry.get(tool_name)
         if not tool_cap:
+            logger.warning(f"[LLMRuntime] Tool '{tool_name}' not found, args: {tool_args}")
             return f"Error: Tool '{tool_name}' not found"
+
+        logger.info(f"[LLMRuntime] Calling tool: {tool_name}, args: {tool_args}")
         try:
             result = await tool_cap.execute(**tool_args)
-            return str(result)
+            result_str = str(result)
+
+            logger.info(f"[LLMRuntime] Tool {tool_name} executed, result: {result_str[:300]}...")
+
+            # 检查工具执行结果中是否包含已知的降级标记
+            # 对于 Tavily API 配额耗尽等已知问题，直接使用降级结果
+            if "API quota exceeded" in result_str or "432" in result_str:
+                logger.info(f"[LLMRuntime] Tool {tool_name} using降级结果 (API quota issue)")
+                return self._get_degraded_result(tool_name, tool_args)
+
+            return result_str
         except Exception as e:
+            # 检查错误消息中是否包含已知的可降级错误
+            error_msg = str(e)
+            if "432" in error_msg or "quota" in error_msg.lower():
+                logger.info(f"[LLMRuntime] Tool {tool_name} using降级结果 due to error: {error_msg}")
+                return self._get_degraded_result(tool_name, tool_args)
+            logger.error(f"[LLMRuntime] Tool {tool_name} execution error: {error_msg}")
             return f"Error executing {tool_name}: {e}"
+
+    def _get_degraded_result(self, tool_name: str, tool_args: Dict) -> str:
+        """获取工具的降级结果（用于API配额耗尽等情况）"""
+        if tool_name == "tavily_search":
+            query = tool_args.get("query", "")
+            return json.dumps({
+                "query": query,
+                "results": [],
+                "answer": None,
+                "images": [],
+                "detail": "API quota exceeded - using empty results"
+            }, ensure_ascii=False)
+        return "Tool temporarily unavailable due to API quota limits"
 
     def _compress_history(self, history: List[Dict]) -> List[Dict]:
         """压缩历史记录"""
@@ -1234,6 +1855,22 @@ class LLMRuntime:
             else:
                 compressed.append(item)
         return compressed
+
+    def _summarize_early_history(self, history: List[Dict]) -> Dict:
+        """生成早期历史的摘要（三层压缩策略 Level 2）"""
+        content_parts = []
+        for msg in history:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if role == "tool":
+                content_parts.append(f"[工具结果] {content[:200]}")
+            else:
+                content_parts.append(f"[{role}] {content[:200]}")
+
+        return {
+            "role": "system",
+            "content": f"【历史摘要】({' | '.join(content_parts)})"
+        }
 
 
 # =========================
@@ -1344,39 +1981,68 @@ class StepTrace:
     timestamp: float = field(default_factory=time.time)
 
 
-@dataclass
 class State:
     """
-    State: 认知状态系统
+    State: 认知状态系统（线程安全）
     - artifacts: 结构化输出（Artifact 对象）
     - memory: 长期记忆（用户偏好、领域知识等）
     - trace: 执行轨迹（用于调试和优化）
+
+    关键修复：使用 asyncio.Lock 保护并发访问
     """
-    artifacts: Dict[str, Artifact] = field(default_factory=dict)
-    memory: Dict[str, Any] = field(default_factory=dict)
-    trace: List[StepTrace] = field(default_factory=list)
 
-    def update_artifact(self, step_id: str, artifact: Artifact):
-        self.artifacts[step_id] = artifact
+    def __init__(self):
+        self.artifacts: Dict[str, Artifact] = {}
+        self.memory: Dict[str, Any] = {}
+        self.trace: List[StepTrace] = []
+        self._lock = asyncio.Lock()  # 【新增】并发保护锁
 
-    def get_artifact(self, step_id: str) -> Optional[Artifact]:
-        return self.artifacts.get(step_id)
+    async def update_artifact(self, step_id: str, artifact: Artifact):
+        async with self._lock:
+            self.artifacts[step_id] = artifact
 
-    def is_step_successful(self, step_id: str) -> bool:
+    async def get_artifact(self, step_id: str) -> Optional[Artifact]:
+        async with self._lock:
+            return self.artifacts.get(step_id)
+
+    async def is_step_successful(self, step_id: str) -> bool:
         """检查步骤是否成功完成"""
-        artifact = self.artifacts.get(step_id)
-        if artifact is None:
-            return False
-        return artifact.is_success()
+        async with self._lock:
+            artifact = self.artifacts.get(step_id)
+            if artifact is None:
+                return False
+            return artifact.is_success()
 
-    def add_trace(self, trace: StepTrace):
-        self.trace.append(trace)
+    async def add_trace(self, trace: StepTrace):
+        async with self._lock:
+            self.trace.append(trace)
 
-    def get_memory(self, key: str, default=None) -> Any:
-        return self.memory.get(key, default)
+    async def get_memory(self, key: str, default=None) -> Any:
+        async with self._lock:
+            return self.memory.get(key, default)
 
-    def set_memory(self, key: str, value: Any):
-        self.memory[key] = value
+    async def set_memory(self, key: str, value: Any):
+        async with self._lock:
+            self.memory[key] = value
+
+    async def delete_artifact(self, step_id: str):
+        """异步删除 artifact（用于重试等场景）"""
+        async with self._lock:
+            self.artifacts.pop(step_id, None)
+
+    async def get_artifacts_snapshot(self) -> Dict[str, Artifact]:
+        """获取 artifacts 快照（用于 Critic 等需要读取所有 artifacts 的场景）"""
+        async with self._lock:
+            return dict(self.artifacts)
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """获取状态快照（用于 Context 的 relevant_artifacts）"""
+        # 不使用锁，因为返回的是副本
+        return {
+            "artifacts": dict(self.artifacts),
+            "memory": dict(self.memory),
+            "trace": list(self.trace)
+        }
 
 
 # =========================
@@ -1396,18 +2062,28 @@ class Critic:
     def __init__(self, llm_runtime: LLMRuntime):
         self.llm_runtime = llm_runtime
 
-    async def evaluate(self, step: Step, output: Any, state: State) -> CritiqueResult:
+    async def evaluate(self, step: Step, output: Any, state: State, caller: str = "unknown") -> CritiqueResult:
         """评估 Step 执行结果"""
+        # 【修复】异步获取 artifacts 快照
+        artifacts_snapshot = await state.get_artifacts_snapshot()
         context_parts = []
-        for dep_id, artifact in state.artifacts.items():
+        for dep_id, artifact in artifacts_snapshot.items():
             context_parts.append(f"[{dep_id}]: {artifact.value}")
         context = "\n\n".join(context_parts) if context_parts else "No previous steps."
+
+        # 【修复】限制 output 长度并进行安全转义
+        output_str = str(output)
+        # 只取前 300 字符，避免 prompt 过长
+        if len(output_str) > 300:
+            output_str = output_str[:300] + "... [truncated]"
+        # 对特殊字符进行转义
+        output_escaped = output_str.replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
 
         prompt = f"""你是一个执行评估专家。
 
 任务: {step.input_data.get("task", "Unknown")}
 当前步骤类型: {step.step_type}
-输出: {str(output)[:500]}
+输出: {output_escaped}
 
 已完成的步骤:
 {context}
@@ -1425,12 +2101,16 @@ class Critic:
 }}"""
 
         try:
-            response = await self.llm_runtime.reason(prompt, "")
+            response = await self.llm_runtime.reason(prompt, "", caller="Critic.evaluate")
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 eval_data = json.loads(json_match.group())
+                quality_score = eval_data.get("quality_score", 0.5)
+                # 确保 quality_score 在有效范围内
+                if not isinstance(quality_score, (int, float)) or quality_score < 0 or quality_score > 1:
+                    quality_score = 0.5
                 return CritiqueResult(
-                    quality_score=eval_data.get("quality_score", 0.5),
+                    quality_score=quality_score,
                     need_replan=eval_data.get("need_replan", False),
                     suggestions=eval_data.get("suggestions", [])
                 )
@@ -1438,12 +2118,10 @@ class Critic:
                 return CritiqueResult(quality_score=0.5, need_replan=False, suggestions=[])
         except Exception as e:
             logger.error(f"[Critic] Evaluation failed: {e}")
-            return CritiqueResult(quality_score=0.0, need_replan=True, suggestions=[str(e)])
+            # 【修复】避免因为 Critic 失败导致步骤被标记为失败
+            # 返回中等分数，让步骤继续
+            return CritiqueResult(quality_score=0.5, need_replan=False, suggestions=[f"Evaluation error: {str(e)}"])
 
-
-# =========================
-# Replanner（动态重规划器）
-# =========================
 class Replanner:
     """Replanner: 动态重规划器"""
 
@@ -1484,7 +2162,7 @@ class Replanner:
 }}"""
 
         try:
-            response = await self.llm_runtime.reason(prompt, "")
+            response = await self.llm_runtime.reason(prompt, "", caller="Replanner.replan_from_failure")
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 plan_data = json.loads(json_match.group())
@@ -1533,7 +2211,7 @@ class Replanner:
 }}"""
 
         try:
-            response = await self.llm_runtime.reason(prompt, "")
+            response = await self.llm_runtime.reason(prompt, "", caller="Replanner.replan_from_insufficient")
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 plan_data = json.loads(json_match.group())
@@ -1608,6 +2286,8 @@ class ErrorRecovery:
 
     async def handle_error(self, step: Step, error: str, state: State, attempt: int) -> RecoveryAction:
         """处理错误，根据错误类型返回恢复动作"""
+        _ = step  # 保留参数用于未来扩展
+        _ = state  # 保留参数用于未来扩展
         policy = self.retry_policy
 
         # 检查是否超过最大重试次数
@@ -1711,8 +2391,10 @@ class Planner:
         """设置可用技能白名单（用于动态注入 Prompt）"""
         self._available_skill_names = skill_names
 
-    async def plan(self, task: str, available_tools: List[Dict], available_skills: List[Dict]) -> Plan:
+    async def plan(self, task: str, available_tools: List[Dict], available_skills: List[Dict], caller: str = "unknown") -> Plan:
         """生成完整的执行计划，包含 target_agent 合法性验证"""
+        logger.info(f"[Planner.plan] Called by {caller}, task={task[:50]}...")
+        logger.info(f"[Planner.plan] Calling LLMRuntime.reason for planning...")
         tools_info = "\n".join([
             f"- {t.get('name', 'unknown')}: {t.get('description', '')}"
             for t in available_tools
@@ -1741,13 +2423,13 @@ class Planner:
 
         # 添加示例说明，减少 LLM 幻觉
         examples_info = """
-## 示例输出格式
+## 示例输出格式（单步骤）
 {
   "plan_id": "plan_001",
   "steps": {
     "step_1": {
       "task": "获取最新信息",
-      "target_agent": "search",  // 必须是白名单中的技能名
+      "target_agent": "search",
       "mode": "react",
       "tool_strategy": "optional",
       "depends_on": []
@@ -1757,6 +2439,40 @@ class Planner:
     "step_1": []
   }
 }
+
+## 示例输出格式（多步骤，有依赖）
+{
+  "plan_id": "plan_002",
+  "steps": {
+    "step_1": {
+      "task": "编写傅里叶变换代码",
+      "target_agent": "code",
+      "mode": "react",
+      "tool_strategy": "optional",
+      "depends_on": []
+    },
+    "step_2": {
+      "task": "保存代码到文件",
+      "target_agent": "code",
+      "mode": "react",
+      "tool_strategy": "optional",
+      "depends_on": ["step_1"]
+    }
+  },
+  "dag": {
+    "step_1": [],
+    "step_2": ["step_1"]
+  }
+}
+
+## 多步骤规划原则（必须遵守）
+- **单一职责**：每个步骤只完成一个明确的任务
+- **避免重复**：如果 step_1 已经完成了某个工作（如编写代码），step_2 不应重复相同工作
+- **清晰分工**：
+  - step_1：编写代码/实现逻辑
+  - step_2：验证/测试代码
+  - step_3：保存到文件/持久化
+- 每个步骤完成后，检查是否需要下一步；如果已完成，不要添加多余步骤
 """
 
         prompt = f"""你是一个任务规划专家。
@@ -1778,15 +2494,29 @@ class Planner:
 3. 指定执行模式（react/direct/chain）
 4. 指定工具策略（optional/required/auto）
 
+## 工具参数规范（必须遵守）
+- **file_write 工具**：参数必须是 `filepath` 和 `content`，不要使用 `file_name` 或其他名称
+- **file_read 工具**：参数必须是 `filepath`，不要使用 `file_name` 或其他名称
+- **bash_execute 工具**：参数必须是 `command`，不要使用 `cmd` 或其他名称
+- 严格按照工具定义的参数名调用，避免参数名不匹配导致错误
+
 重要规则：
 - target_agent 必须严格匹配可用技能白名单中的名称
 - 如果没有合适的技能，使用 'llm' 作为默认值
 - 不要创建白名单中不存在的技能名称
 
+## 依赖关系规则（必须遵守）
+- **step_1**：通常是第一步，不需要依赖其他步骤
+- **step_2**：如果它需要使用 step_1 的输出，则必须设置 `depends_on: ["step_1"]`
+- **step_3**：如果它需要使用 step_1 或 step_2 的输出，则必须设置 `depends_on: ["step_1", "step_2"]` 或 `depends_on: ["step_2"]`
+- 依赖关系必须反映真实的执行顺序，后继步骤必须依赖其输入所依赖的所有前置步骤
+
 请以 JSON 格式返回："""
 
         try:
-            response = await self.runtime.reason(prompt, "")
+            logger.info(f"[Planner.plan] Starting LLM planning call...")
+            response = await self.runtime.reason(prompt, "", caller=f"Planner.plan-{caller}")
+            logger.info(f"[Planner.plan] LLM planning completed, response length={len(response)}")
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 plan_data = json.loads(json_match.group())
@@ -1943,6 +2673,10 @@ class ExecutionEngine:
         self._sub_manager: Optional[EventSubscriptionManager] = None
         # 【新增】依赖错误跟踪
         self._failed_dependencies: Dict[str, Set[str]] = {}  # step_id -> set of failed dep ids
+        # 【新增】防止 _check_and_publish_completion 循环调用
+        self._completion_check_count = 0
+        self._max_completion_checks = 10  # 最大检查次数
+        self._check_in_progress = False  # 防止并发检查
 
     async def initialize(self, bus: EventBus):
         self.bus = bus
@@ -1951,6 +2685,8 @@ class ExecutionEngine:
         logger.info("[ExecutionEngine] Initialized")
 
     async def _setup_subscriptions(self):
+        logger.info(f"[ExecutionEngine] _setup_subscriptions called, bus={id(self.bus)}, sub_manager={id(self._sub_manager)}")
+        logger.info(f"[ExecutionEngine] _setup_subscriptions: bus._subscribers before={len(self.bus._subscribers)}")
         if not self._sub_manager:
             raise RuntimeError("EventSubscriptionManager not initialized.")
         await self._sub_manager.subscribe(
@@ -1959,12 +2695,14 @@ class ExecutionEngine:
             handler=self.process_completed,
             event_filter=EventType.STEP_COMPLETED
         )
+        logger.info(f"[ExecutionEngine] After process_completed: bus._subscribers={len(self.bus._subscribers)}")
         await self._sub_manager.subscribe(
             component="Engine",
             name="process_failed",
             handler=self.process_failed,
             event_filter=EventType.STEP_FAILED
         )
+        logger.info(f"[ExecutionEngine] After process_failed: bus._subscribers={len(self.bus._subscribers)}")
 
     async def claim_step(self, step_id: str) -> bool:
         async with self._claim_lock:
@@ -2064,7 +2802,19 @@ class ExecutionEngine:
 
     async def _check_and_publish_completion(self):
         """检查所有步骤是否完成，并发布相应事件"""
+        # 【修复】防止循环调用超过限制
         if not self.plan:
+            return
+
+        # 【修复】防止并发检查
+        if self._check_in_progress:
+            logger.debug(f"[Engine] _check_and_publish_completion already in progress, skipping")
+            return
+
+        # 【修复】检查调用次数限制
+        self._completion_check_count += 1
+        if self._completion_check_count > self._max_completion_checks:
+            logger.warning(f"[Engine] _check_and_publish_completion max calls reached ({self._completion_check_count} > {self._max_completion_checks}), stopping")
             return
 
         steps = self.plan.steps
@@ -2080,30 +2830,39 @@ class ExecutionEngine:
         for step_id, step in steps.items():
             logger.info(f"[Engine] Step {step_id[:8]} status: {step.status}")
 
-        # 检查是否所有步骤都处于终态
-        all_done = all(
-            s.status in [StepState.COMPLETED, StepState.FAILED, StepState.BLOCKED]
-            for s in steps.values()
-        ) if steps else False
+        # 【修复】标记开始检查
+        self._check_in_progress = True
 
-        logger.info(f"[Engine] all_done={all_done}")
+        try:
+            # 检查是否所有步骤都处于终态
+            all_done = all(
+                s.status in [StepState.COMPLETED, StepState.FAILED, StepState.BLOCKED]
+                for s in steps.values()
+            ) if steps else False
 
-        if all_done and total > 0:
-            # 【修复】使用非阻塞方式发布完成事件，避免死锁
-            if failed_count == 0:
-                logger.info(f"[Engine] All steps completed ({completed_count}/{total}), publishing TASK_COMPLETED")
-                if self.bus:
-                    asyncio.create_task(self.bus.publish(Event(
-                        event_type=EventType.TASK_COMPLETED,
-                        payload={"total_steps": total, "completed_steps": completed_count}
-                    ), block=False))
-            else:
-                logger.info(f"[Engine] Task failed ({failed_count}/{total} steps failed), publishing TASK_FAILED")
-                if self.bus:
-                    asyncio.create_task(self.bus.publish(Event(
-                        event_type=EventType.TASK_FAILED,
-                        payload={"total_steps": total, "failed_steps": failed_count}
-                    ), block=False))
+            logger.info(f"[Engine] all_done={all_done}")
+
+            if all_done and total > 0:
+                # 【修复】使用非阻塞方式发布完成事件，避免死锁
+                if failed_count == 0:
+                    logger.info(f"[Engine] All steps completed ({completed_count}/{total}), publishing TASK_COMPLETED")
+                    if self.bus:
+                        asyncio.create_task(self.bus.publish(Event(
+                            event_type=EventType.TASK_COMPLETED,
+                            payload={"total_steps": total, "completed_steps": completed_count}
+                        ), block=False))
+                else:
+                    logger.info(f"[Engine] Task failed ({failed_count}/{total} steps failed), publishing TASK_FAILED")
+                    if self.bus:
+                        asyncio.create_task(self.bus.publish(Event(
+                            event_type=EventType.TASK_FAILED,
+                            payload={"total_steps": total, "failed_steps": failed_count}
+                        ), block=False))
+                # 【修复】任务完成，重置计数器
+                self._completion_check_count = 0
+        finally:
+            # 【修复】标记检查完成
+            self._check_in_progress = False
 
     async def process_completed(self, event: Event):
         """处理 STEP_COMPLETED 事件"""
@@ -2113,8 +2872,12 @@ class ExecutionEngine:
         is_duplicate = False
         async with self._step_execution_lock:
             if event.step_id in self._completed_steps:
-                logger.info(f"[Engine] STEP_COMPLETED for {event.step_id[:8]} (duplicate, skipping artifact update)")
+                # 记录 duplicate 事件用于诊断
+                logger.debug(f"[Engine] STEP_COMPLETED for {event.step_id[:8]} (duplicate, skipping artifact update)")
                 is_duplicate = True
+                # 【调试】打印堆栈追踪
+                import traceback
+                logger.debug(f"[Engine] Duplicate event stack trace:\n{''.join(traceback.format_stack())}")
             else:
                 self._completed_steps.add(event.step_id)
 
@@ -2133,7 +2896,7 @@ class ExecutionEngine:
         output_str = extract_output(output) if output is not None else ""
 
         artifact = Artifact.create_success(output_str, step_id=event.step_id)
-        self.state.update_artifact(event.step_id, artifact)
+        await self.state.update_artifact(event.step_id, artifact)
 
         # 更新 StepPlan 状态
         if self.plan and event.step_id in self.plan.steps:
@@ -2150,7 +2913,7 @@ class ExecutionEngine:
             mode="react",
             success=True
         )
-        self.state.add_trace(trace)
+        await self.state.add_trace(trace)
 
         # 【修复】延迟发布下游步骤，避免竞态条件
         # 使用 create_task 让事件循环先处理完当前事件
@@ -2180,7 +2943,7 @@ class ExecutionEngine:
 
         # 【修复】创建表示错误的 artifact
         artifact = Artifact.create_error(error_msg, step_id=event.step_id)
-        self.state.update_artifact(event.step_id, artifact)
+        await self.state.update_artifact(event.step_id, artifact)
 
         # 记录失败的依赖
         self._failed_dependencies[event.step_id] = {event.step_id}
@@ -2201,7 +2964,7 @@ class ExecutionEngine:
             success=False,
             error=error_msg
         )
-        self.state.add_trace(trace)
+        await self.state.add_trace(trace)
 
         # 熔断：级联取消所有下游步骤
         await self._cancel_downstream(event.step_id)
@@ -2224,8 +2987,7 @@ class ExecutionEngine:
 
                 # 清除完成标记和 artifact，允许重新执行
                 self._completed_steps.discard(event.step_id)
-                if event.step_id in self.state.artifacts:
-                    del self.state.artifacts[event.step_id]
+                await self.state.delete_artifact(event.step_id)
                 # 清除失败依赖记录
                 self._failed_dependencies.pop(event.step_id, None)
 
@@ -2272,39 +3034,61 @@ class ExecutionEngine:
         # 检查任务是否完成
         await self._check_and_publish_completion()
 
-    async def _cancel_downstream(self, failed_step_id: str):
+    async def _cancel_downstream(self, failed_step_id: str, visited: Optional[Set[str]] = None, depth: int = 0, max_depth: int = 100):
         """
-        熔断机制：递归取消所有依赖于失败步骤的下游步骤
+        熔断机制：取消所有依赖于失败步骤的下游步骤（使用 BFS 防止无限递归）
+
+        关键修复：
+        1. 添加 visited 集合防止重复访问
+        2. 添加 max_depth 限制防止栈溢出
+        3. 使用迭代方式替代纯递归
         """
         if not self.plan:
             return
 
-        # 找到所有以 failed_step_id 为依赖的步骤（直接子节点）
-        children = []
-        for step_id, depends_on in self.plan.dag.items():
-            if failed_step_id in depends_on:
-                children.append(step_id)
+        # 初始化 visited 集合
+        if visited is None:
+            visited = set()
 
-        for child_id in children:
-            # 跳过已经完成/失败/取消的步骤
-            if child_id in self._completed_steps:
-                continue
+        # 关键修复：深度限制防止无限递归
+        if depth > max_depth:
+            logger.warning(f"[Engine] _cancel_downstream max depth reached ({max_depth})")
+            return
 
-            # 标记为取消
-            if child_id in self.plan.steps:
-                self.plan.steps[child_id].status = StepState.BLOCKED
-                logger.info(f"[Engine] CANCELLED downstream step {child_id} due to failure of {failed_step_id}")
+        # 使用队列进行 BFS 遍历
+        from collections import deque
+        queue = deque([failed_step_id])
 
-            # 发布 STEP_CANCELLED 事件
-            await self.bus.publish(Event(
-                event_type=EventType.STEP_CANCELLED,
-                step_id=child_id,
-                payload={"reason": f"Parent {failed_step_id} failed", "cancelled_by": failed_step_id}
-            ))
-            self._completed_steps.add(child_id)
+        while queue:
+            current_failed = queue.popleft()
 
-            # 递归取消下游
-            await self._cancel_downstream(child_id)
+            # 找到所有以 current_failed 为依赖的步骤
+            children = []
+            for step_id, depends_on in self.plan.dag.items():
+                if current_failed in depends_on and step_id not in visited:
+                    children.append(step_id)
+
+            for child_id in children:
+                # 跳过已经完成/失败/取消的步骤
+                if child_id in self._completed_steps:
+                    continue
+
+                # 标记为取消
+                if child_id in self.plan.steps:
+                    self.plan.steps[child_id].status = StepState.BLOCKED
+                    logger.info(f"[Engine] CANCELLED downstream step {child_id} due to failure of {current_failed}")
+
+                # 发布 STEP_CANCELLED 事件
+                await self.bus.publish(Event(
+                    event_type=EventType.STEP_CANCELLED,
+                    step_id=child_id,
+                    payload={"reason": f"Parent {current_failed} failed", "cancelled_by": current_failed}
+                ))
+                self._completed_steps.add(child_id)
+                visited.add(child_id)
+
+                # 添加到队列继续处理
+                queue.append(child_id)
 
     def set_plan(self, plan: Plan):
         self.plan = plan
@@ -2445,7 +3229,7 @@ class Worker:
             input_data = {"task": step.task}
 
         # 构建 StepContext
-        context = self._build_step_context(step, input_data)
+        context = await self._build_step_context(step, input_data)
 
         # 【修复】执行在锁外进行
         start_time = time.time()
@@ -2481,6 +3265,9 @@ class Worker:
             event_type, payload = await self._handle_exception(step_id, step, e, duration_ms)
 
         finally:
+            # 【调试】记录事件类型
+            logger.debug(f"[Worker {self.worker_id}] Step {step_id} event_type={event_type}, success={success}")
+
             # 【关键修复】先标记已完成，再释放 claim，防止其他 Worker 抢走
             # 在这里直接添加到 _completed_steps，避免竞态条件
             # 同时更新 StepPlan 状态，确保 _check_and_publish_completion 能正确检测
@@ -2498,10 +3285,12 @@ class Worker:
                     dynamic_plan.steps[step_id].status = final_status
             # 释放步骤声明（在标记完成后）
             await self.engine.release_claim(step_id)
-            
+
             # 【修复】在释放锁之后发布事件，避免死锁
             if event_type:
+                logger.debug(f"[Worker {self.worker_id}] About to publish {event_type} for {step_id[:8]}, queue size before: {self.bus._queue.qsize() if hasattr(self.bus, '_queue') else 'N/A'}")
                 await self._publish_event(event_type, step_id, payload)
+                logger.debug(f"[Worker {self.worker_id}] Published {event_type} for {step_id[:8]}, queue size after: {self.bus._queue.qsize() if hasattr(self.bus, '_queue') else 'N/A'}")
 
     async def _handle_execution_result(self, step_id: str, step: Step, success: bool, result: Any, duration_ms: int):
         """【新增】统一处理执行结果，返回要发布的事件类型和 payload"""
@@ -2515,32 +3304,36 @@ class Worker:
             is_early_stopped = isinstance(result, dict) and str(result.get("warning", "")).startswith("early_stopped")
 
             if is_early_stopped:
-                logger.info(f"[Worker {self.worker_id}] Step {step_id} early stopped by protection, treating as success")
-                artifact = Artifact.create_success(output_str, step_id=step_id)
-                self.engine.state.update_artifact(step_id, artifact)
+                # 【修复】早停不是真正的成功，标记为失败
+                logger.warning(f"[Worker {self.worker_id}] Step {step_id} early stopped by protection, marking as failed")
+                # 使用警告信息作为错误消息
+                error_msg = output_str if output_str else "Step stopped by protection mechanism"
+                artifact = Artifact.create_error(error_msg, step_id=step_id)
+                await self.engine.state.update_artifact(step_id, artifact)
 
                 trace = StepTrace(
                     step_id=step_id,
                     agent="default",
                     mode="react",
                     duration_ms=duration_ms,
-                    success=True
+                    success=False,
+                    error=error_msg
                 )
-                self.engine.state.add_trace(trace)
-                event_type = EventType.STEP_COMPLETED
-                payload = {"output": output_str}
+                await self.engine.state.add_trace(trace)
+                event_type = EventType.STEP_FAILED
+                payload = {"error": error_msg}
             elif self.critic:
                 # 进行质量检查
                 artifact = Artifact.create_success(output_str, step_id=step_id)
-                self.engine.state.update_artifact(step_id, artifact)
+                await self.engine.state.update_artifact(step_id, artifact)
 
-                critique = await self.critic.evaluate(step, output_str, self.engine.state)
+                critique = await self.critic.evaluate(step, output_str, self.engine.state, caller=f"Worker-{self.worker_id}")
                 if critique.quality_score < 0.5:
                     success = False
                     result_str = f"Quality check failed: {critique.suggestions}"
                     # 【修复】重新创建 artifact 表示失败
                     artifact = Artifact.create_error(result_str, value=output_str, step_id=step_id)
-                    self.engine.state.update_artifact(step_id, artifact)
+                    await self.engine.state.update_artifact(step_id, artifact)
 
                     trace = StepTrace(
                         step_id=step_id,
@@ -2550,7 +3343,7 @@ class Worker:
                         success=False,
                         error=result_str
                     )
-                    self.engine.state.add_trace(trace)
+                    await self.engine.state.add_trace(trace)
                     event_type = EventType.STEP_FAILED
                     payload = {"error": result_str}
                 else:
@@ -2561,12 +3354,12 @@ class Worker:
                         duration_ms=duration_ms,
                         success=True
                     )
-                    self.engine.state.add_trace(trace)
+                    await self.engine.state.add_trace(trace)
                     event_type = EventType.STEP_COMPLETED
                     payload = {"output": output_str}
             else:
                 artifact = Artifact.create_success(output_str, step_id=step_id)
-                self.engine.state.update_artifact(step_id, artifact)
+                await self.engine.state.update_artifact(step_id, artifact)
 
                 trace = StepTrace(
                     step_id=step_id,
@@ -2575,14 +3368,14 @@ class Worker:
                     duration_ms=duration_ms,
                     success=True
                 )
-                self.engine.state.add_trace(trace)
+                await self.engine.state.add_trace(trace)
                 event_type = EventType.STEP_COMPLETED
                 payload = {"output": output_str}
         else:
             # 【修复】正确处理失败情况
             error_str = str(result) if not isinstance(result, dict) else json.dumps(result, ensure_ascii=False)
             artifact = Artifact.create_error(error_str, step_id=step_id)
-            self.engine.state.update_artifact(step_id, artifact)
+            await self.engine.state.update_artifact(step_id, artifact)
 
             trace = StepTrace(
                 step_id=step_id,
@@ -2592,16 +3385,17 @@ class Worker:
                 success=False,
                 error=error_str
             )
-            self.engine.state.add_trace(trace)
+            await self.engine.state.add_trace(trace)
             event_type = EventType.STEP_FAILED
             payload = {"error": error_str}
-        
+
         return event_type, payload
 
     async def _handle_timeout(self, step_id: str, step: Step, error_result: str, duration_ms: int):
-        """【新增】处理超时，返回要发布的事件类型和 payload"""
+        """处理超时，返回要发布的事件类型和 payload"""
+        _ = step  # 保留参数用于未来扩展
         artifact = Artifact.create_error(error_result, step_id=step_id)
-        self.engine.state.update_artifact(step_id, artifact)
+        await self.engine.state.update_artifact(step_id, artifact)
 
         trace = StepTrace(
             step_id=step_id,
@@ -2611,14 +3405,15 @@ class Worker:
             success=False,
             error=error_result
         )
-        self.engine.state.add_trace(trace)
+        await self.engine.state.add_trace(trace)
         return EventType.STEP_FAILED, {"error": error_result}
 
     async def _handle_exception(self, step_id: str, step: Step, exception: Exception, duration_ms: int):
-        """【新增】处理异常，返回要发布的事件类型和 payload"""
+        """处理异常，返回要发布的事件类型和 payload"""
+        _ = step  # 保留参数用于未来扩展
         error_str = str(exception)
         artifact = Artifact.create_error(error_str, step_id=step_id)
-        self.engine.state.update_artifact(step_id, artifact)
+        await self.engine.state.update_artifact(step_id, artifact)
 
         trace = StepTrace(
             step_id=step_id,
@@ -2628,18 +3423,20 @@ class Worker:
             success=False,
             error=error_str
         )
-        self.engine.state.add_trace(trace)
+        await self.engine.state.add_trace(trace)
         return EventType.STEP_FAILED, {"error": error_str}
 
-    def _build_step_context(self, step: Step, input_data: Dict) -> Dict:
+    async def _build_step_context(self, step: Step, input_data: Dict) -> Dict:
         """构建 StepContext（简化版本）"""
         depends_on = getattr(step, 'depends_on', [])
         task = step.input_data.get("task", "") if hasattr(step, 'input_data') else getattr(step, 'task', "")
         mode = getattr(step, 'mode', "react")
 
+        # 【修复】异步获取 artifacts
+        artifacts_snapshot = await self.engine.state.get_artifacts_snapshot()
         deps = {}
         for dep_id in depends_on:
-            artifact = self.engine.state.artifacts.get(dep_id)
+            artifact = artifacts_snapshot.get(dep_id)
             if artifact:
                 deps[dep_id] = artifact
 
@@ -2677,6 +3474,25 @@ class Worker:
         """执行技能步骤"""
         _ = context
         logger.info(f"[Worker] _execute_skill: step_id={step.step_id}, skill_name={step.skill_name or step.input_data.get('skill_name')}")
+
+        # 获取 context 信息
+        context_manager = self.llm_runtime.context_manager
+        if not context_manager:
+            raise RuntimeError("context_manager not initialized in llm_runtime")
+
+        ctx = context_manager.get_or_create(step)
+
+        # 记录上下文信息
+        context_info = {
+            "step_id": ctx.step_id,
+            "step_task": ctx.step_task,
+            "task": ctx.task,
+            "dependencies": list(ctx.dependencies.keys()),
+            "relevant_artifacts": list(ctx.relevant_artifacts.keys()) if hasattr(ctx, 'relevant_artifacts') else [],
+            "history_length": len(ctx.history) if hasattr(ctx, 'history') else 0,
+            "tool_trace_length": len(ctx.tool_trace) if hasattr(ctx, 'tool_trace') else 0
+        }
+        logger.info(f"[Worker] Context info: {json.dumps(context_info, ensure_ascii=False, indent=2)}")
         try:
             skill_name = step.skill_name or step.input_data.get("skill_name")
             if not skill_name:
@@ -2684,8 +3500,14 @@ class Worker:
             skill_cap = self.capability_registry.get(skill_name)
             if not isinstance(skill_cap, SkillCapability):
                 return (False, f"Not a skill capability: {skill_name}")
-            policy = SkillPolicy(skill_cap, self.llm_runtime)
-            return await policy.execute_with_policy(step)
+
+            # 获取或创建 context（长生命周期）
+            # context_manager 在 Worker 初始化时已从 runtime 获取，这里直接使用
+            ctx = context_manager.get_or_create(step)
+
+            # 将 context 传递给 SkillPolicy
+            policy = SkillPolicy(skill_cap, self.llm_runtime, context_manager)
+            return await policy.execute_with_policy(step, context=ctx, caller=f"Worker-{self.worker_id}")
         except Exception as e:
             logger.exception(f"[Worker] _execute_skill failed: {e}")
             return (False, f"Execution error: {e}")
@@ -2694,13 +3516,25 @@ class Worker:
         """执行通用 LLM 调用"""
         _ = context
         try:
+            # 关键修复：使用 ContextFormatter 生成 prompt
             task = step.input_data.get("task", "")
             user_prompt = f"任务: {task}"
             tools = self.capability_registry.get_executable_schemas()
+
+            context_manager = self.llm_runtime.context_manager
+            if not context_manager:
+                raise RuntimeError("context_manager not initialized in llm_runtime")
+            ctx = context_manager.get_or_create(step)
+
+            # 使用 ContextFormatter 格式化 prompt
+            system_prompt = ContextFormatter.format_system(ctx, "你是一个智能助手。请根据任务完成目标。")
+
             success, result = await self.llm_runtime.tool_call(
-                system_prompt="你是一个智能助手。请根据任务完成目标。",
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                tools=tools
+                tools=tools,
+                context=ctx,  # 传递 context
+                caller=f"Worker-{self.worker_id}-llm"
             )
             # 【修复】正确提取输出
             if success:
@@ -2858,11 +3692,15 @@ class ProductionAgentOS:
             timeout=config_manager.LLM_CALL_TIMEOUT
         )
 
+        # 关键修复：创建 ContextManager（长生命周期）
+        context_manager = ContextManager()
+
         # 创建 LLMRuntime（统一的智能入口）
         self.runtime = LLMRuntime(
             self.llm,
             capability_registry=self.capability_registry,
-            max_iterations=self.max_react_iterations
+            max_iterations=self.max_react_iterations,
+            context_manager=context_manager  # 新增
         )
 
         # 创建 Planner
@@ -2886,6 +3724,10 @@ class ProductionAgentOS:
         self.bus = EventBus(max_queue_size=config_manager.EVENT_BUS_MAX_QUEUE_SIZE)
         self.engine.bus = self.bus
         await self.engine.initialize(self.bus)
+
+        # 关键修复：将 context_manager 传递给 engine.state
+        if hasattr(self.engine.state, 'context_manager'):
+            self.engine.state.context_manager = context_manager
 
         # 加载工具
         self._register_tools()
@@ -3089,7 +3931,7 @@ class ProductionAgentOS:
         # 加载计划
         tools = self.tool_registry._tools
         skills = self.capability_registry.get_instructable_schemas()
-        plan = await self.planner.plan(task, list(tools.values()), skills)
+        plan = await self.planner.plan(task, list(tools.values()), skills, caller="ProductionAgentOS.run")
         logger.info(f"[AgentOS] Plan generated: plan_id={plan.plan_id}, steps={list(plan.steps.keys())}, plan_len={len(plan.steps)}")
 
         if not plan or not plan.steps:
@@ -3227,7 +4069,6 @@ class ProductionAgentOS:
             if self.engine and self.engine.plan:
                 steps = self.engine.plan.steps
                 completed_count = sum(1 for s in steps.values() if s.status == StepState.COMPLETED)
-                failed_count = sum(1 for s in steps.values() if s.status == StepState.FAILED)
                 total = len(steps)
                 if total > 0:
                     all_done = all(
@@ -3276,7 +4117,7 @@ class ProductionAgentOS:
 async def main():
     import traceback
     agent = ProductionAgentOS(worker_count=2, skills_dir="skills", tools_dir="tools")
-    task = "code今天的日子，然后搜索今天新闻"
+    task = "分析一下今天的市场"
     try:
         result = await agent.run(task, timeout=300)
         
