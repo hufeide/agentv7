@@ -2484,16 +2484,18 @@ class Worker:
             # 【关键修复】先标记已完成，再释放 claim，防止其他 Worker 抢走
             # 在这里直接添加到 _completed_steps，避免竞态条件
             # 同时更新 StepPlan 状态，确保 _check_and_publish_completion 能正确检测
+            # 【修复】根据最终的事件类型设置正确的步骤状态
+            final_status = StepState.COMPLETED if event_type == EventType.STEP_COMPLETED else StepState.FAILED
             async with self.engine._step_execution_lock:
                 self.engine._completed_steps.add(step_id)
                 self.engine._executing_steps.discard(step_id)
                 # 更新 StepPlan 状态
                 if self.engine.plan and step_id in self.engine.plan.steps:
-                    self.engine.plan.steps[step_id].status = StepState.COMPLETED
+                    self.engine.plan.steps[step_id].status = final_status
                 # 更新 dynamic_plan 状态（如果存在）
                 dynamic_plan = getattr(self.engine, 'dynamic_plan', None)
                 if dynamic_plan and step_id in dynamic_plan.steps:
-                    dynamic_plan.steps[step_id].status = StepState.COMPLETED
+                    dynamic_plan.steps[step_id].status = final_status
             # 释放步骤声明（在标记完成后）
             await self.engine.release_claim(step_id)
             

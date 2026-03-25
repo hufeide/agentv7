@@ -12,7 +12,7 @@ class FileReadTool:
     def __init__(self, base_dir: str = "."):
         self.base_dir = base_dir
 
-    async async def execute(self, filepath: str) -> Dict[str, Any]:
+    async def execute(self, filepath: str) -> Dict[str, Any]:
         """执行文件读取（符合工具接口）"""
         return await self.read_file(filepath)
 
@@ -178,3 +178,7 @@ class FileWriteTool:
     async def append_file(self, filepath: str, content: str) -> Dict[str, Any]:
         """追加到文件"""
         return await self.write_file(filepath, content, mode="a", overwrite=False)
+
+    async def execute(self, filepath: str, content: str, mode: str = "w", overwrite: bool = False) -> Dict[str, Any]:
+        """执行文件写入（符合工具接口）"""
+        return await self.write_file(filepath, content, mode=mode, overwrite=overwrite)
