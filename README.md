@@ -191,3 +191,79 @@ flowchart TB
 
 
     <img width="18778" height="6072" alt="deepseek_mermaid_20260325_006bd9" src="https://github.com/user-attachments/assets/78dce30c-40b2-42a1-80d1-a855f7938521" />
+
+
+
+
+
+sequenceDiagram
+    participant User
+    participant AgentOS as ProductionAgentOS
+    participant Planner
+    participant Engine as ExecutionEngine
+    participant Worker
+    participant LLM as LLMRuntime
+    participant State as State/Context
+
+    User->>AgentOS: run(task="分析市场")
+    
+    Note over AgentOS: 【阶段1: 初始化】
+    AgentOS->>AgentOS: initialize()
+    AgentOS->>LLM: 创建 AsyncOpenAI 客户端
+    AgentOS->>AgentOS: 创建 ContextManager(长生命周期)
+    AgentOS->>AgentOS: 加载 Tools + Skills 到 CapabilityRegistry
+    
+    Note over AgentOS,Planner: 【阶段2: 规划】
+    AgentOS->>Planner: plan(task, tools, skills)
+    Planner->>LLM: reason(prompt="分解任务...")
+    LLM-->>Planner: 返回 JSON 计划
+    Planner->>Planner: 解析为 Plan(steps, dag)
+    Planner-->>AgentOS: Plan(plan_id, 3 steps)
+    
+    Note over AgentOS,Engine: 【阶段3: 执行准备】
+    AgentOS->>Engine: set_plan(plan)
+    AgentOS->>Engine: 创建 DynamicPlan(Step 对象)
+    AgentOS->>Engine: start()
+    Engine->>Engine: _publish_ready_steps()
+    Engine->>Engine: 检查 DAG 依赖 → step_1 就绪
+    Engine->>Worker: 发布 STEP_READY(step_1)
+    
+    Note over Worker,LLM: 【阶段4: 步骤执行循环】
+    loop 每个步骤执行
+        Worker->>Worker: claim_step(step_1)
+        Worker->>ContextMgr: get_or_create(step_1)
+        Worker->>LLM: tool_call(system_prompt, user_prompt, tools)
+        
+        loop ReAct 迭代 (max 10 次)
+            LLM->>LLM: 调用 vLLM API
+            alt 需要工具调用
+                LLM->>CapabilityReg: execute(tool_name, args)
+                CapabilityReg-->>LLM: 返回工具结果
+                LLM->>LLM: 记录 tool_trace + history
+            else 直接返回答案
+                LLM-->>Worker: (success=True, output)
+            end
+        end
+        
+        Worker->>State: update_artifact(step_1, output)
+        Worker->>Engine: 发布 STEP_COMPLETED(step_1)
+    end
+    
+    Note over Engine: 【阶段5: 依赖推进】
+    Engine->>Engine: process_completed(event)
+    Engine->>Engine: _publish_ready_steps()
+    Engine->>Engine: 检查 step_2 依赖 step_1 ✓ → 发布 STEP_READY
+    Engine->>Worker: 发布 STEP_READY(step_2)
+    
+    Note over AgentOS: 【阶段6: 任务完成】
+    Engine->>Engine: _check_and_publish_completion()
+    Engine->>AgentOS: 发布 TASK_COMPLETED
+    AgentOS->>AgentOS: 收集 artifacts → 构建结果
+    AgentOS-->>User: 返回 JSON 结果
+
+
+
+![Uploading mermaid-1774501451203.png…]()
+
+
+    
